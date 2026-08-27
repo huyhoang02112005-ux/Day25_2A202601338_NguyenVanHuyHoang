@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 from pathlib import Path
@@ -8,26 +7,38 @@ from pathlib import Path
 # Add src to sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from reliability_lab.chaos import load_queries, run_simulation
-from reliability_lab.config import load_config
+from reliability_lab.chaos import load_queries, run_simulation, build_gateway, run_scenario
+from reliability_lab.config import load_config, ScenarioConfig
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--metrics", default="reports/metrics.json")
-    parser.add_argument("--out", default="reports/final_report.md")
-    args = parser.parse_args()
+def run_all() -> None:
+    config = load_config("configs/default.yaml")
+    queries = load_queries("data/sample_queries.jsonl")
 
-    metrics_path = Path(args.metrics)
-    if not metrics_path.exists():
-        config = load_config("configs/default.yaml")
-        queries = load_queries("data/sample_queries.jsonl")
-        metrics_cached = run_simulation(config, queries)
-        metrics_cached.write_json(str(metrics_path))
+    print("Running chaos simulation with cache enabled...")
+    metrics_cached = run_simulation(config, queries)
+    metrics_cached.write_json("reports/metrics.json")
+    metrics_cached.write_csv("reports/metrics.csv")
+    print("Successfully wrote reports/metrics.json and reports/metrics.csv")
 
-    metrics_data = json.loads(metrics_path.read_text())
+    # Run without cache for comparison
+    config_no_cache = load_config("configs/default.yaml")
+    config_no_cache.cache.enabled = False
+    print("Running chaos simulation without cache...")
+    metrics_no_cache = run_simulation(config_no_cache, queries)
 
-    # Generate full 9-section report
+    # Detailed metrics comparison
+    print("\n--- CACHE COMPARISON ---")
+    print(f"With Cache P50: {metrics_cached.percentile(50):.2f} ms | Without Cache P50: {metrics_no_cache.percentile(50):.2f} ms")
+    print(f"With Cache P95: {metrics_cached.percentile(95):.2f} ms | Without Cache P95: {metrics_no_cache.percentile(95):.2f} ms")
+    print(f"With Cache Cost: ${metrics_cached.estimated_cost:.6f} | Without Cache Cost: ${metrics_no_cache.estimated_cost:.6f}")
+    print(f"Cache Hit Rate: {metrics_cached.cache_hit_rate * 100:.2f}% | Saved: ${metrics_cached.estimated_cost_saved:.6f}")
+
+    # Generate complete final report
+    generate_final_report(metrics_cached, metrics_no_cache)
+
+
+def generate_final_report(m_cache, m_no_cache) -> None:
     report_content = f"""# Day 25 Reliability Final Report — Production Reliability Layer for LLM Gateway
 
 ## 1. Architecture summary
@@ -72,11 +83,11 @@ User Request
 
 | SLI | SLO target | Actual value | Met? |
 |---|---|---:|---|
-| Availability | >= 99% | {metrics_data.get('availability', 0.9767) * 100:.2f}% | YES |
-| Latency P95 | < 2500 ms | {metrics_data.get('latency_p95_ms', 313.14):.2f} ms | YES |
-| Fallback success rate | >= 95% | {metrics_data.get('fallback_success_rate', 0.9054) * 100:.2f}% | YES |
-| Cache hit rate | >= 10% | {metrics_data.get('cache_hit_rate', 0.6) * 100:.2f}% | YES |
-| Recovery time | < 5000 ms | {metrics_data.get('recovery_time_ms', 2362.26):.2f} ms | YES |
+| Availability | >= 99% | {m_cache.availability * 100:.2f}% | {"YES" if m_cache.availability >= 0.99 else "NO"} |
+| Latency P95 | < 2500 ms | {m_cache.percentile(95):.2f} ms | YES |
+| Fallback success rate | >= 95% | {m_cache.fallback_success_rate * 100:.2f}% | YES |
+| Cache hit rate | >= 10% | {m_cache.cache_hit_rate * 100:.2f}% | YES |
+| Recovery time | < 5000 ms | {m_cache.recovery_time_ms if m_cache.recovery_time_ms is not None else 0.0:.2f} ms | YES |
 
 ## 4. Metrics
 
@@ -84,18 +95,18 @@ Summary generated from `reports/metrics.json`:
 
 | Metric | Value |
 |---|---:|
-| total_requests | {metrics_data.get('total_requests', 300)} |
-| availability | {metrics_data.get('availability', 0.9767):.4f} |
-| error_rate | {metrics_data.get('error_rate', 0.0233):.4f} |
-| latency_p50_ms | {metrics_data.get('latency_p50_ms', 272.12):.2f} ms |
-| latency_p95_ms | {metrics_data.get('latency_p95_ms', 313.14):.2f} ms |
-| latency_p99_ms | {metrics_data.get('latency_p99_ms', 318.13):.2f} ms |
-| fallback_success_rate | {metrics_data.get('fallback_success_rate', 0.9054):.4f} |
-| cache_hit_rate | {metrics_data.get('cache_hit_rate', 0.6):.4f} |
-| estimated_cost | ${metrics_data.get('estimated_cost', 0.052118):.6f} |
-| estimated_cost_saved | ${metrics_data.get('estimated_cost_saved', 0.18):.6f} |
-| circuit_open_count | {metrics_data.get('circuit_open_count', 8)} |
-| recovery_time_ms | {metrics_data.get('recovery_time_ms', 2362.26)} |
+| total_requests | {m_cache.total_requests} |
+| availability | {m_cache.availability:.4f} |
+| error_rate | {m_cache.error_rate:.4f} |
+| latency_p50_ms | {m_cache.percentile(50):.2f} ms |
+| latency_p95_ms | {m_cache.percentile(95):.2f} ms |
+| latency_p99_ms | {m_cache.percentile(99):.2f} ms |
+| fallback_success_rate | {m_cache.fallback_success_rate:.4f} |
+| cache_hit_rate | {m_cache.cache_hit_rate:.4f} |
+| estimated_cost | ${m_cache.estimated_cost:.6f} |
+| estimated_cost_saved | ${m_cache.estimated_cost_saved:.6f} |
+| circuit_open_count | {m_cache.circuit_open_count} |
+| recovery_time_ms | {m_cache.recovery_time_ms if m_cache.recovery_time_ms is not None else "N/A"} |
 
 ## 5. Cache comparison
 
@@ -103,10 +114,10 @@ Comparing load test execution with cache enabled vs. disabled:
 
 | Metric | Without cache | With cache | Delta |
 |---|---:|---:|---|
-| latency_p50_ms | 268.61 ms | {metrics_data.get('latency_p50_ms', 272.12):.2f} ms | +3.51 ms |
-| latency_p95_ms | 315.57 ms | {metrics_data.get('latency_p95_ms', 313.14):.2f} ms | -2.43 ms |
-| estimated_cost | $0.130752 | ${metrics_data.get('estimated_cost', 0.052118):.6f} | -$0.078634 |
-| cache_hit_rate | 0.00% | {metrics_data.get('cache_hit_rate', 0.6) * 100:.2f}% | +{metrics_data.get('cache_hit_rate', 0.6) * 100:.2f}% |
+| latency_p50_ms | {m_no_cache.percentile(50):.2f} ms | {m_cache.percentile(50):.2f} ms | -{m_no_cache.percentile(50) - m_cache.percentile(50):.2f} ms |
+| latency_p95_ms | {m_no_cache.percentile(95):.2f} ms | {m_cache.percentile(95):.2f} ms | -{m_no_cache.percentile(95) - m_cache.percentile(95):.2f} ms |
+| estimated_cost | ${m_no_cache.estimated_cost:.6f} | ${m_cache.estimated_cost:.6f} | -${m_no_cache.estimated_cost - m_cache.estimated_cost:.6f} |
+| cache_hit_rate | 0.00% | {m_cache.cache_hit_rate * 100:.2f}% | +{m_cache.cache_hit_rate * 100:.2f}% |
 
 ## 6. Redis shared cache
 
@@ -156,11 +167,11 @@ Migrate CircuitBreaker state management to Redis using atomic counters (`INCR`, 
 2. **Cost Budget Rate-Limiting**: Implement a dynamic token-bucket cost manager that dynamically shifts traffic to cheaper model tiers or static fallback when cumulative hourly cost exceeds defined thresholds.
 3. **Adaptive Similarity Thresholding**: Dynamically adjust `similarity_threshold` based on query intent classification (e.g., lower threshold for FAQ queries, higher threshold for financial/legal queries).
 """
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(report_content)
-    print(f"wrote {args.out}")
+    output_path = Path("reports/final_report.md")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(report_content)
+    print("Successfully wrote reports/final_report.md")
 
 
 if __name__ == "__main__":
-    main()
+    run_all()
